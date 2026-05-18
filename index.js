@@ -3,6 +3,7 @@ require("dotenv").config();
 const express = require("express");
 const { Telegraf } = require("telegraf");
 const { createClient } = require("@supabase/supabase-js");
+const OpenAI = require("openai");
 
 const app = express();
 
@@ -22,8 +23,67 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_KEY
 );
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
 const userState = {};
+
+async function analyzeExperimentMessage(message) {
+  const today = new Date().toISOString();
+
+  const response = await openai.chat.completions.create({
+    model: "gpt-4.1-mini",
+    messages: [
+      {
+        role: "system",
+        content: `
+Você é um agente de experimentos de marketing.
+
+Analise mensagens livres e extraia informações sobre testes.
+
+Responda SOMENTE em JSON válido.
+
+Data atual: ${today}
+
+Campos:
+- intent
+- title
+- platform
+- format
+- tested_element
+- objective
+- hypothesis
+- metric
+- channel
+- publish_at_text
+- review_at_text
+- test_link
+- missing_fields
+- follow_up_question
+
+Regras:
+- Se for criação de teste: intent = create_experiment
+- Extraia o máximo possível
+- Não invente métricas
+- Não invente links
+- Se faltar algo importante, coloque em missing_fields
+- Faça apenas as perguntas necessárias
+`
+      },
+      {
+        role: "user",
+        content: message
+      }
+    ],
+    temperature: 0.2,
+    response_format: {
+      type: "json_object"
+    }
+  });
+
+  return JSON.parse(response.choices[0].message.content);
+}
 
 function parseDate(input) {
   const text = input.toLowerCase().trim();
@@ -255,32 +315,91 @@ bot.on("text", async (ctx) => {
     const state = userState[telegramId];
 
     if (!state) {
+      const analysis = await analyzeExperimentMessage(message);
+    
+      if (analysis.intent !== "create_experiment") {
+        return ctx.reply(
+          "Me diga algo como:\n\nVou testar um novo hook no Instagram hoje às 14 e quero revisar semana que vem."
+        );
+      }
+    
       const { data, error } = await supabase
         .from("experiments")
         .insert({
-          title: message,
+          title: analysis.title || message,
+          raw_message: message,
+          platform: analysis.platform || null,
+          format: analysis.format || null,
+          tested_element: analysis.tested_element || null,
+          objective: analysis.objective || null,
+          hypothesis: analysis.hypothesis || null,
+          metric: analysis.metric || null,
+          channel: analysis.channel || analysis.platform || null,
+          test_link: analysis.test_link || null,
+          missing_fields: analysis.missing_fields || [],
           created_by: telegramId,
           telegram_chat_id: chatId,
-          status: "draft",
+          status:
+            analysis.missing_fields && analysis.missing_fields.length
+              ? "draft"
+              : "active",
         })
         .select()
         .single();
-
+    
       if (error) {
         console.log(error);
         return ctx.reply("Erro ao criar o teste ❌");
       }
-
-      userState[telegramId] = {
-        experimentId: data.id,
-        step: "ask_link",
-      };
-
+    
+      if (analysis.missing_fields && analysis.missing_fields.length) {
+        userState[telegramId] = {
+          experimentId: data.id,
+          step: "ai_followup",
+        };
+    
+        return ctx.reply(
+          `Entendi o teste ✅\n\n` +
+            `ID: ${data.id}\n` +
+            `Título: ${data.title}\n` +
+            `Canal: ${analysis.platform || analysis.channel || "não informado"}\n` +
+            `Formato: ${analysis.format || "não informado"}\n` +
+            `Elemento testado: ${analysis.tested_element || "não informado"}\n\n` +
+            `${analysis.follow_up_question || "Me envie as informações que faltam."}`
+        );
+      }
+    
       return ctx.reply(
-        "Onde esse teste vai acontecer? Envie o link ou local."
+        `Teste criado ✅\n\n` +
+          `ID: ${data.id}\n` +
+          `Título: ${data.title}\n` +
+          `Canal: ${analysis.platform || analysis.channel || "não informado"}\n` +
+          `Métrica: ${analysis.metric || "não informada"}`
       );
     }
-
+    
+    if (state.step === "ai_followup") {
+      const analysis = await analyzeExperimentMessage(
+        `Informações complementares do teste: ${message}`
+      );
+    
+      await supabase
+        .from("experiments")
+        .update({
+          metric: analysis.metric || undefined,
+          hypothesis: analysis.hypothesis || undefined,
+          objective: analysis.objective || undefined,
+          test_link: analysis.test_link || undefined,
+          missing_fields: [],
+          status: "active",
+        })
+        .eq("id", state.experimentId);
+    
+      const experimentId = state.experimentId;
+      delete userState[telegramId];
+    
+      return ctx.reply(`Teste atualizado e ativado ✅\n\nID do teste: ${experimentId}`);
+    }
     if (state.step === "ask_link") {
       await supabase
         .from("experiments")
