@@ -45,6 +45,38 @@ const analyticsDataClient = google.analyticsdata({
 
 const userState = {};
 
+function normalizeText(text = "") {
+  return text
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/sao paulo/g, "sao-paulo")
+    .replace(/belo horizonte/g, "belo-horizonte")
+    .replace(/buenos aires/g, "buenos-aires")
+    .replace(/mexico city/g, "mexico-city")
+    .replace(/panama city/g, "panama-city")
+    .replace(/ilha grande/g, "ilha-grande")
+    .replace(/san jose/g, "san-jose")
+    .replace(/santo domingo/g, "santo-domingo")
+    .replace(/playa del carmen/g, "playa")
+    .replace(/cook in rio/g, "rio cook")
+    .replace(/lp do/g, "")
+    .replace(/lp da/g, "")
+    .replace(/landing page/g, "")
+    .trim();
+}
+
+function extractPath(urlOrPath = "") {
+  try {
+    if (urlOrPath.startsWith("http")) {
+      return new URL(urlOrPath).pathname.replace(/\/$/, "");
+    }
+    return urlOrPath.replace(/\/$/, "");
+  } catch {
+    return urlOrPath;
+  }
+}
+
 async function analyzeExperimentMessage(message) {
   const today = new Date().toISOString();
 
@@ -62,7 +94,7 @@ Responda SOMENTE em JSON válido.
 
 Data atual: ${today}
 
-Campos:
+Campos obrigatórios no JSON:
 - intent
 - title
 - platform
@@ -72,6 +104,9 @@ Campos:
 - hypothesis
 - metric
 - channel
+- city
+- category
+- page_query
 - publish_at_text
 - review_at_text
 - test_link
@@ -79,13 +114,21 @@ Campos:
 - follow_up_question
 
 Regras:
-- Se for criação de teste: intent = create_experiment
-- Se for comando, pergunta solta ou consulta, intent = unknown
-- Extraia o máximo possível
-- Não invente métricas
-- Não invente links
-- Se faltar algo importante, coloque em missing_fields
-- Faça apenas as perguntas necessárias
+- Se for criação de teste, intent = create_experiment.
+- Se for comando, pergunta solta ou consulta, intent = unknown.
+- Se o usuário falar "lp", "landing page", "página", "site", "Cook in Rio", "Cook in São Paulo", extraia city e category quando possível.
+- "Cook in Rio" normalmente significa city = rio e category = cook.
+- "food crawl no Rio" significa city = rio e category = food-crawl.
+- "tasting", "taste" ou "degustação" significa category = taste.
+- "aula", "cooking class", "cook" ou "cozinha" significa category = cook.
+- "churrasco" ou "bbq" significa category = bbq.
+- "frutas" significa category = fruit.
+- "drinks" significa category = drinks-and-appetizers ou drinks-and-view se houver contexto.
+- Extraia o máximo possível.
+- Não invente métricas.
+- Não invente links.
+- Se faltar algo importante, coloque em missing_fields.
+- Faça apenas as perguntas necessárias.
 `
       },
       {
@@ -108,29 +151,118 @@ function formatDate(date) {
   });
 }
 
-async function getGA4Summary() {
+async function findLandingPage(analysis, message) {
+  const text = normalizeText(
+    `${message} ${analysis.city || ""} ${analysis.category || ""} ${analysis.page_query || ""}`
+  );
+
+  let city = normalizeText(analysis.city || "");
+  let category = normalizeText(analysis.category || "");
+
+  if (!city) {
+    const knownCities = [
+      "rio", "sao-paulo", "belo-horizonte", "brasilia", "buenos-aires",
+      "cancun", "cartagena", "cuenca", "curitiba", "florianopolis",
+      "fortaleza", "foz", "ilha-grande", "lima", "mendoza", "merida",
+      "mexico-city", "monterrey", "panama-city", "playa", "quito",
+      "salvador", "san-jose", "santiago", "santo-domingo", "cusco",
+      "bogota", "medellin", "guadalajara", "natal"
+    ];
+
+    city = knownCities.find((c) => text.includes(c)) || "";
+  }
+
+  if (!category) {
+    if (text.includes("food crawl") || text.includes("food-crawl") || text.includes("walking")) category = "food-crawl";
+    else if (text.includes("taste") || text.includes("tasting") || text.includes("degustacao")) category = "taste";
+    else if (text.includes("bbq") || text.includes("churrasco")) category = "bbq";
+    else if (text.includes("fruit") || text.includes("fruta")) category = "fruit";
+    else if (text.includes("drink")) category = "drinks-and-appetizers";
+    else if (text.includes("seafood")) category = "seafood";
+    else if (text.includes("cook") || text.includes("cozinha") || text.includes("aula")) category = "cook";
+  }
+
+  if (!city && !category) return null;
+
+  let query = supabase.from("landing_pages").select("*").limit(10);
+
+  if (city) query = query.eq("city", city);
+  if (category) query = query.ilike("category", `%${category}%`);
+
+  let { data, error } = await query;
+
+  if (error) {
+    console.log("Erro ao buscar landing page:", error);
+    return null;
+  }
+
+  if (data && data.length === 1) return data[0];
+
+  if (data && data.length > 1) {
+    const exact = data.find(
+      (p) => normalizeText(p.city) === city && normalizeText(p.category) === category
+    );
+    return exact || data[0];
+  }
+
+  if (city) {
+    const fallback = await supabase
+      .from("landing_pages")
+      .select("*")
+      .eq("city", city)
+      .limit(10);
+
+    if (!fallback.error && fallback.data?.length === 1) {
+      return fallback.data[0];
+    }
+
+    if (!fallback.error && fallback.data?.length > 1 && category) {
+      const match = fallback.data.find((p) =>
+        normalizeText(p.category).includes(category)
+      );
+      if (match) return match;
+    }
+  }
+
+  return null;
+}
+
+async function getGA4Summary(pagePath = null) {
+  const requestBody = {
+    dateRanges: [
+      {
+        startDate: "7daysAgo",
+        endDate: "today",
+      },
+    ],
+    metrics: [
+      { name: "activeUsers" },
+      { name: "sessions" },
+      { name: "screenPageViews" },
+    ],
+  };
+
+  if (pagePath) {
+    requestBody.dimensions = [{ name: "pagePath" }];
+    requestBody.dimensionFilter = {
+      filter: {
+        fieldName: "pagePath",
+        stringFilter: {
+          matchType: "CONTAINS",
+          value: pagePath,
+        },
+      },
+    };
+  }
+
   const response = await analyticsDataClient.properties.runReport({
     property: `properties/${process.env.GA4_PROPERTY_ID}`,
-    requestBody: {
-      dateRanges: [
-        {
-          startDate: "7daysAgo",
-          endDate: "today",
-        },
-      ],
-      metrics: [
-        { name: "activeUsers" },
-        { name: "sessions" },
-        { name: "screenPageViews" },
-      ],
-    },
+    requestBody,
   });
 
   const rows = response.data.rows?.[0];
 
-  if (!rows) {
-    return null;
-  }
+  if (!rows) return null;
 
   return {
     users: rows.metricValues[0].value,
@@ -141,7 +273,7 @@ async function getGA4Summary() {
 
 bot.start((ctx) => {
   ctx.reply(
-    "Bot de experimentos ativo 🚀\n\nComandos:\n/testes_ativos\n/concluidos\n/aprendizados\n/ver ID\n/buscar termo\n/concluir ID\n/ga\n\nOu me diga diretamente o que você quer testar."
+    "Bot de experimentos ativo 🚀\n\nComandos:\n/testes_ativos\n/concluidos\n/aprendizados\n/ver ID\n/buscar termo\n/concluir ID\n/ga\n/ga /rio-cook\n\nOu me diga diretamente o que você quer testar."
   );
 });
 
@@ -160,16 +292,18 @@ bot.on("text", async (ctx) => {
       name,
     });
 
-    if (message === "/ga") {
+    if (message.startsWith("/ga")) {
       try {
-        const data = await getGA4Summary();
+        const rawPath = message.replace("/ga", "").trim();
+        const pagePath = rawPath ? extractPath(rawPath) : null;
+        const data = await getGA4Summary(pagePath);
 
         if (!data) {
           return ctx.reply("Nenhum dado encontrado no GA4.");
         }
 
         return ctx.reply(
-          `📊 Google Analytics (últimos 7 dias)\n\n` +
+          `📊 Google Analytics ${pagePath ? `(${pagePath})` : "(últimos 7 dias)"}\n\n` +
             `👥 Usuários: ${data.users}\n` +
             `🧭 Sessões: ${data.sessions}\n` +
             `📄 Visualizações: ${data.pageviews}`
@@ -194,7 +328,7 @@ bot.on("text", async (ctx) => {
       const text = data
         .map(
           (t) =>
-            `#${t.id} ${t.title}\nMétrica: ${
+            `#${t.id} ${t.title}\nLink: ${t.test_link || "não informado"}\nMétrica: ${
               t.metric || "não informada"
             }\nRevisão: ${formatDate(t.review_at)}`
         )
@@ -299,7 +433,7 @@ bot.on("text", async (ctx) => {
           (t) =>
             `#${t.id} ${t.title}\nStatus: ${
               t.status
-            }\nMétrica: ${
+            }\nLink: ${t.test_link || "não informado"}\nMétrica: ${
               t.metric || "não informada"
             }\nAprendizado: ${t.learning || "sem aprendizado registrado"}`
         )
@@ -325,12 +459,15 @@ bot.on("text", async (ctx) => {
 
     if (!state) {
       const analysis = await analyzeExperimentMessage(message);
+      const landingPage = await findLandingPage(analysis, message);
 
       if (analysis.intent !== "create_experiment") {
         return ctx.reply(
-          "Me diga algo como:\n\nVou testar um novo hook no Instagram hoje às 14 e quero revisar semana que vem."
+          "Me diga algo como:\n\nVou testar um CTA novo na LP do Cook in Rio e quero revisar daqui uma semana."
         );
       }
+
+      const finalUrl = analysis.test_link || landingPage?.url || null;
 
       const { data, error } = await supabase
         .from("experiments")
@@ -344,7 +481,7 @@ bot.on("text", async (ctx) => {
           hypothesis: analysis.hypothesis || null,
           metric: analysis.metric || null,
           channel: analysis.channel || analysis.platform || null,
-          test_link: analysis.test_link || null,
+          test_link: finalUrl,
           missing_fields: analysis.missing_fields || [],
           created_by: telegramId,
           telegram_chat_id: chatId,
@@ -374,10 +511,10 @@ bot.on("text", async (ctx) => {
             `Canal: ${
               analysis.platform || analysis.channel || "não informado"
             }\n` +
-            `Formato: ${analysis.format || "não informado"}\n` +
             `Elemento testado: ${
               analysis.tested_element || "não informado"
-            }\n\n` +
+            }\n` +
+            `Página identificada: ${finalUrl || "não identificada"}\n\n` +
             `${analysis.follow_up_question || "Me envie as informações que faltam."}`
         );
       }
@@ -386,9 +523,7 @@ bot.on("text", async (ctx) => {
         `Teste criado ✅\n\n` +
           `ID: ${data.id}\n` +
           `Título: ${data.title}\n` +
-          `Canal: ${
-            analysis.platform || analysis.channel || "não informado"
-          }\n` +
+          `Página identificada: ${finalUrl || "não identificada"}\n` +
           `Métrica: ${analysis.metric || "não informada"}`
       );
     }
@@ -487,8 +622,6 @@ async function checkReminders() {
 }
 
 setInterval(checkReminders, 60 * 1000);
-
-bot.launch();
 
 bot.launch()
   .then(() => {
