@@ -490,4 +490,13 @@ setInterval(checkReminders, 60 * 1000);
 
 bot.launch();
 
-console.log("Bot rodando 🚀");
+bot.launch()
+  .then(() => {
+    console.log("Bot rodando 🚀");
+  })
+  .catch((error) => {
+    console.log("Erro ao iniciar bot:", error.message);
+  });
+
+process.once("SIGINT", () => bot.stop("SIGINT"));
+process.once("SIGTERM", () => bot.stop("SIGTERM"));
