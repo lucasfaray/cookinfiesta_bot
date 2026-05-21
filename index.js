@@ -4,6 +4,7 @@ const express = require("express");
 const { Telegraf } = require("telegraf");
 const { createClient } = require("@supabase/supabase-js");
 const OpenAI = require("openai");
+const { google } = require("googleapis");
 
 const app = express();
 
@@ -23,8 +24,23 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_KEY
 );
+
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
+});
+
+const oauth2Client = new google.auth.OAuth2(
+  process.env.GOOGLE_CLIENT_ID,
+  process.env.GOOGLE_CLIENT_SECRET
+);
+
+oauth2Client.setCredentials({
+  refresh_token: process.env.GOOGLE_REFRESH_TOKEN,
+});
+
+const analyticsDataClient = google.analyticsdata({
+  version: "v1beta",
+  auth: oauth2Client,
 });
 
 const userState = {};
@@ -64,6 +80,7 @@ Campos:
 
 Regras:
 - Se for criação de teste: intent = create_experiment
+- Se for comando, pergunta solta ou consulta, intent = unknown
 - Extraia o máximo possível
 - Não invente métricas
 - Não invente links
@@ -77,43 +94,10 @@ Regras:
       }
     ],
     temperature: 0.2,
-    response_format: {
-      type: "json_object"
-    }
+    response_format: { type: "json_object" }
   });
 
   return JSON.parse(response.choices[0].message.content);
-}
-
-function parseDate(input) {
-  const text = input.toLowerCase().trim();
-  const now = new Date();
-
-  if (text.includes("amanhã")) {
-    now.setDate(now.getDate() + 1);
-    now.setHours(9, 0, 0, 0);
-    return now;
-  }
-
-  const daquiMatch = text.match(/daqui (\d+) dias?/);
-
-  if (daquiMatch) {
-    now.setDate(now.getDate() + Number(daquiMatch[1]));
-    now.setHours(9, 0, 0, 0);
-    return now;
-  }
-
-  const dateMatch = text.match(/(\d{2})\/(\d{2})\/(\d{4})/);
-
-  if (dateMatch) {
-    const day = Number(dateMatch[1]);
-    const month = Number(dateMatch[2]) - 1;
-    const year = Number(dateMatch[3]);
-
-    return new Date(year, month, day, 9, 0, 0);
-  }
-
-  return null;
 }
 
 function formatDate(date) {
@@ -124,15 +108,46 @@ function formatDate(date) {
   });
 }
 
+async function getGA4Summary() {
+  const response = await analyticsDataClient.properties.runReport({
+    property: `properties/${process.env.GA4_PROPERTY_ID}`,
+    requestBody: {
+      dateRanges: [
+        {
+          startDate: "7daysAgo",
+          endDate: "today",
+        },
+      ],
+      metrics: [
+        { name: "activeUsers" },
+        { name: "sessions" },
+        { name: "screenPageViews" },
+      ],
+    },
+  });
+
+  const rows = response.data.rows?.[0];
+
+  if (!rows) {
+    return null;
+  }
+
+  return {
+    users: rows.metricValues[0].value,
+    sessions: rows.metricValues[1].value,
+    pageviews: rows.metricValues[2].value,
+  };
+}
+
 bot.start((ctx) => {
   ctx.reply(
-    "Bot de experimentos ativo 🚀\n\nComandos:\n/testes_ativos\n/concluidos\n/aprendizados\n/ver ID\n/buscar termo\n/concluir ID\n\nOu me diga diretamente o que você quer testar."
+    "Bot de experimentos ativo 🚀\n\nComandos:\n/testes_ativos\n/concluidos\n/aprendizados\n/ver ID\n/buscar termo\n/concluir ID\n/ga\n\nOu me diga diretamente o que você quer testar."
   );
 });
 
 bot.on("text", async (ctx) => {
   try {
-    const message = ctx.message.text;
+    const message = ctx.message.text.trim();
 
     const telegramId = String(ctx.from.id);
     const chatId = String(ctx.chat.id);
@@ -145,6 +160,26 @@ bot.on("text", async (ctx) => {
       name,
     });
 
+    if (message === "/ga") {
+      try {
+        const data = await getGA4Summary();
+
+        if (!data) {
+          return ctx.reply("Nenhum dado encontrado no GA4.");
+        }
+
+        return ctx.reply(
+          `📊 Google Analytics (últimos 7 dias)\n\n` +
+            `👥 Usuários: ${data.users}\n` +
+            `🧭 Sessões: ${data.sessions}\n` +
+            `📄 Visualizações: ${data.pageviews}`
+        );
+      } catch (err) {
+        console.log(err);
+        return ctx.reply("Erro ao consultar o Google Analytics ❌");
+      }
+    }
+
     if (message === "/testes_ativos") {
       const { data, error } = await supabase
         .from("experiments")
@@ -154,10 +189,7 @@ bot.on("text", async (ctx) => {
         .limit(10);
 
       if (error) return ctx.reply("Erro ao buscar testes ativos ❌");
-
-      if (!data.length) {
-        return ctx.reply("Nenhum teste ativo encontrado.");
-      }
+      if (!data.length) return ctx.reply("Nenhum teste ativo encontrado.");
 
       const text = data
         .map(
@@ -180,10 +212,7 @@ bot.on("text", async (ctx) => {
         .limit(10);
 
       if (error) return ctx.reply("Erro ao buscar testes concluídos ❌");
-
-      if (!data.length) {
-        return ctx.reply("Nenhum teste concluído encontrado.");
-      }
+      if (!data.length) return ctx.reply("Nenhum teste concluído encontrado.");
 
       const text = data
         .map(
@@ -207,16 +236,10 @@ bot.on("text", async (ctx) => {
         .limit(10);
 
       if (error) return ctx.reply("Erro ao buscar aprendizados ❌");
-
-      if (!data.length) {
-        return ctx.reply("Nenhum aprendizado salvo ainda.");
-      }
+      if (!data.length) return ctx.reply("Nenhum aprendizado salvo ainda.");
 
       const text = data
-        .map(
-          (t) =>
-            `#${t.id} ${t.title}\nAprendizado: ${t.learning}`
-        )
+        .map((t) => `#${t.id} ${t.title}\nAprendizado: ${t.learning}`)
         .join("\n\n");
 
       return ctx.reply(text);
@@ -225,9 +248,7 @@ bot.on("text", async (ctx) => {
     if (message.startsWith("/ver")) {
       const id = message.split(" ")[1];
 
-      if (!id) {
-        return ctx.reply("Use assim:\n/ver 12");
-      }
+      if (!id) return ctx.reply("Use assim:\n/ver 12");
 
       const { data, error } = await supabase
         .from("experiments")
@@ -235,9 +256,7 @@ bot.on("text", async (ctx) => {
         .eq("id", id)
         .single();
 
-      if (error || !data) {
-        return ctx.reply("Teste não encontrado.");
-      }
+      if (error || !data) return ctx.reply("Teste não encontrado.");
 
       return ctx.reply(
         `#${data.id} ${data.title}\n\nStatus: ${
@@ -250,18 +269,14 @@ bot.on("text", async (ctx) => {
           data.review_at
         )}\nResultado: ${
           data.result || "não informado"
-        }\nAprendizado: ${
-          data.learning || "não informado"
-        }`
+        }\nAprendizado: ${data.learning || "não informado"}`
       );
     }
 
     if (message.startsWith("/buscar")) {
       const term = message.replace("/buscar", "").trim();
 
-      if (!term) {
-        return ctx.reply("Use assim:\n/buscar cta");
-      }
+      if (!term) return ctx.reply("Use assim:\n/buscar cta");
 
       const { data, error } = await supabase
         .from("experiments")
@@ -277,9 +292,7 @@ bot.on("text", async (ctx) => {
         return ctx.reply("Erro ao buscar testes ❌");
       }
 
-      if (!data.length) {
-        return ctx.reply("Nenhum teste encontrado.");
-      }
+      if (!data.length) return ctx.reply("Nenhum teste encontrado.");
 
       const text = data
         .map(
@@ -288,9 +301,7 @@ bot.on("text", async (ctx) => {
               t.status
             }\nMétrica: ${
               t.metric || "não informada"
-            }\nAprendizado: ${
-              t.learning || "sem aprendizado registrado"
-            }`
+            }\nAprendizado: ${t.learning || "sem aprendizado registrado"}`
         )
         .join("\n\n");
 
@@ -300,9 +311,7 @@ bot.on("text", async (ctx) => {
     if (message.startsWith("/concluir")) {
       const experimentId = message.split(" ")[1];
 
-      if (!experimentId) {
-        return ctx.reply("Use assim:\n/concluir 12");
-      }
+      if (!experimentId) return ctx.reply("Use assim:\n/concluir 12");
 
       userState[telegramId] = {
         experimentId,
@@ -316,13 +325,13 @@ bot.on("text", async (ctx) => {
 
     if (!state) {
       const analysis = await analyzeExperimentMessage(message);
-    
+
       if (analysis.intent !== "create_experiment") {
         return ctx.reply(
           "Me diga algo como:\n\nVou testar um novo hook no Instagram hoje às 14 e quero revisar semana que vem."
         );
       }
-    
+
       const { data, error } = await supabase
         .from("experiments")
         .insert({
@@ -346,43 +355,49 @@ bot.on("text", async (ctx) => {
         })
         .select()
         .single();
-    
+
       if (error) {
         console.log(error);
         return ctx.reply("Erro ao criar o teste ❌");
       }
-    
+
       if (analysis.missing_fields && analysis.missing_fields.length) {
         userState[telegramId] = {
           experimentId: data.id,
           step: "ai_followup",
         };
-    
+
         return ctx.reply(
           `Entendi o teste ✅\n\n` +
             `ID: ${data.id}\n` +
             `Título: ${data.title}\n` +
-            `Canal: ${analysis.platform || analysis.channel || "não informado"}\n` +
+            `Canal: ${
+              analysis.platform || analysis.channel || "não informado"
+            }\n` +
             `Formato: ${analysis.format || "não informado"}\n` +
-            `Elemento testado: ${analysis.tested_element || "não informado"}\n\n` +
+            `Elemento testado: ${
+              analysis.tested_element || "não informado"
+            }\n\n` +
             `${analysis.follow_up_question || "Me envie as informações que faltam."}`
         );
       }
-    
+
       return ctx.reply(
         `Teste criado ✅\n\n` +
           `ID: ${data.id}\n` +
           `Título: ${data.title}\n` +
-          `Canal: ${analysis.platform || analysis.channel || "não informado"}\n` +
+          `Canal: ${
+            analysis.platform || analysis.channel || "não informado"
+          }\n` +
           `Métrica: ${analysis.metric || "não informada"}`
       );
     }
-    
+
     if (state.step === "ai_followup") {
       const analysis = await analyzeExperimentMessage(
         `Informações complementares do teste: ${message}`
       );
-    
+
       await supabase
         .from("experiments")
         .update({
@@ -394,65 +409,12 @@ bot.on("text", async (ctx) => {
           status: "active",
         })
         .eq("id", state.experimentId);
-    
-      const experimentId = state.experimentId;
-      delete userState[telegramId];
-    
-      return ctx.reply(`Teste atualizado e ativado ✅\n\nID do teste: ${experimentId}`);
-    }
-    if (state.step === "ask_link") {
-      await supabase
-        .from("experiments")
-        .update({
-          test_link: message,
-        })
-        .eq("id", state.experimentId);
-
-      userState[telegramId].step = "ask_metric";
-
-      return ctx.reply(
-        "Qual métrica vamos olhar?\n\nExemplo: cliques, reservas, CTR, conversão."
-      );
-    }
-
-    if (state.step === "ask_metric") {
-      await supabase
-        .from("experiments")
-        .update({
-          metric: message,
-        })
-        .eq("id", state.experimentId);
-
-      userState[telegramId].step = "ask_review_date";
-
-      return ctx.reply(
-        "Quando você quer revisar esse teste?\n\nExemplos:\n- amanhã\n- daqui 3 dias\n- 20/05/2026"
-      );
-    }
-
-    if (state.step === "ask_review_date") {
-      const reviewDate = parseDate(message);
-
-      if (!reviewDate) {
-        return ctx.reply(
-          "Não entendi a data.\n\nUse:\n- amanhã\n- daqui 3 dias\n- 20/05/2026"
-        );
-      }
-
-      await supabase
-        .from("experiments")
-        .update({
-          review_at: reviewDate.toISOString(),
-          status: "active",
-        })
-        .eq("id", state.experimentId);
 
       const experimentId = state.experimentId;
-
       delete userState[telegramId];
 
       return ctx.reply(
-        `Teste ativado ✅\n\nID do teste: ${experimentId}\nVou te lembrar aqui no Telegram.`
+        `Teste atualizado e ativado ✅\n\nID do teste: ${experimentId}`
       );
     }
 
@@ -466,9 +428,7 @@ bot.on("text", async (ctx) => {
 
       userState[telegramId].step = "ask_learning";
 
-      return ctx.reply(
-        "Qual foi o principal aprendizado desse teste?"
-      );
+      return ctx.reply("Qual foi o principal aprendizado desse teste?");
     }
 
     if (state.step === "ask_learning") {
@@ -482,9 +442,7 @@ bot.on("text", async (ctx) => {
 
       delete userState[telegramId];
 
-      return ctx.reply(
-        "Teste concluído e aprendizado salvo ✅"
-      );
+      return ctx.reply("Teste concluído e aprendizado salvo ✅");
     }
   } catch (error) {
     console.log(error);
