@@ -468,6 +468,32 @@ bot.on("text", async (ctx) => {
       }
 
       const finalUrl = analysis.test_link || landingPage?.url || null;
+      let missingFields = Array.isArray(analysis.missing_fields)
+  ? analysis.missing_fields
+  : [];
+
+if (finalUrl) {
+  missingFields = missingFields.filter((field) => {
+    const normalized = normalizeText(field);
+    return (
+      !normalized.includes("link") &&
+      !normalized.includes("url") &&
+      !normalized.includes("pagina") &&
+      !normalized.includes("landing")
+    );
+  });
+}
+
+if (!analysis.metric) {
+  missingFields = [...new Set([...missingFields, "metric"])];
+}
+
+const smartFollowUp =
+  finalUrl && !analysis.metric
+    ? `Identifiquei esta página: ${finalUrl}\n\nEstá correta? E qual métrica você quer acompanhar? Sugestões: cliques no CTA, conversão, reservas, sessões ou visualizações da página.`
+    : finalUrl
+    ? `Identifiquei esta página: ${finalUrl}\n\nEstá correta?`
+    : analysis.follow_up_question || "Me envie as informações que faltam.";
 
       const { data, error } = await supabase
         .from("experiments")
@@ -482,13 +508,10 @@ bot.on("text", async (ctx) => {
           metric: analysis.metric || null,
           channel: analysis.channel || analysis.platform || null,
           test_link: finalUrl,
-          missing_fields: analysis.missing_fields || [],
+          missing_fields: missingFields,
           created_by: telegramId,
           telegram_chat_id: chatId,
-          status:
-            analysis.missing_fields && analysis.missing_fields.length
-              ? "draft"
-              : "active",
+          status: missingFields.length ? "draft" : "active",
         })
         .select()
         .single();
@@ -498,7 +521,7 @@ bot.on("text", async (ctx) => {
         return ctx.reply("Erro ao criar o teste ❌");
       }
 
-      if (analysis.missing_fields && analysis.missing_fields.length) {
+      if (missingFields.length) {
         userState[telegramId] = {
           experimentId: data.id,
           step: "ai_followup",
@@ -515,7 +538,7 @@ bot.on("text", async (ctx) => {
               analysis.tested_element || "não informado"
             }\n` +
             `Página identificada: ${finalUrl || "não identificada"}\n\n` +
-            `${analysis.follow_up_question || "Me envie as informações que faltam."}`
+            `${smartFollowUp}`
         );
       }
 
