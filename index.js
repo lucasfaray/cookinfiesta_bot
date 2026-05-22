@@ -386,7 +386,7 @@ Nunca invente links. Nunca repita dados que o usuário não disse.`,
 // ═══════════════════════════════════════════════════════════
 
 async function findLandingPage(exp, message) {
-  const text = normalizeText(
+  const searchText = normalizeText(
     `${message} ${exp?.city || ""} ${exp?.category || ""} ${exp?.page_query || ""}`
   );
 
@@ -394,41 +394,76 @@ async function findLandingPage(exp, message) {
   let category = normalizeText(exp?.category || "");
 
   if (!city) {
-    city = KNOWN_CITIES.find((c) => text.includes(c)) || "";
+    city = KNOWN_CITIES.find((c) => searchText.includes(c)) || "";
   }
 
   if (!category) {
-    if (text.includes("food crawl") || text.includes("food-crawl") || text.includes("walking")) category = "food-crawl";
-    else if (text.includes("taste") || text.includes("tasting") || text.includes("degustacao")) category = "taste";
-    else if (text.includes("bbq") || text.includes("churrasco")) category = "bbq";
-    else if (text.includes("fruit") || text.includes("fruta")) category = "fruit";
-    else if (text.includes("drink")) category = "drinks-and-appetizers";
-    else if (text.includes("seafood")) category = "seafood";
-    else if (text.includes("cook") || text.includes("cozinha") || text.includes("aula")) category = "cook";
+    if (searchText.includes("food crawl") || searchText.includes("food-crawl")) {
+      category = "food-crawl";
+    } else if (searchText.includes("taste") || searchText.includes("tasting") || searchText.includes("degustacao")) {
+      category = "taste";
+    } else if (searchText.includes("bbq") || searchText.includes("churrasco")) {
+      category = "bbq";
+    } else {
+      category = KNOWN_CATEGORIES.find((c) => searchText.includes(c)) || "";
+    }
   }
 
-  if (!city && !category) return null;
+  const { data, error } = await supabase
+    .from("landing_pages")
+    .select("*");
 
-  let query = supabase.from("landing_pages").select("*").limit(10);
-
-  if (city) query = query.eq("city", city);
-  if (category) query = query.ilike("category", `%${category}%`);
-
-  const { data, error } = await query;
-
-  if (error) {
-    console.log("Erro ao buscar landing page:", error);
+  if (error || !data?.length) {
+    console.log("Erro ao buscar landing pages:", error);
     return null;
   }
 
-  if (data && data.length === 1) return data[0];
+  const scored = data
+    .map((page) => {
+      const city = normalizeText(page.city || "");
+      const category = normalizeText(page.category || "");
+      const url = normalizeText(page.url || "");
+      const combined = `${city} ${category} ${url}`;
 
-  if (data && data.length > 1) {
-    const exact = data.find(
-      (p) => normalizeText(p.city) === city && normalizeText(p.category) === category
-    );
-    return exact || data[0];
-  }
+      let score = 0;
+
+      if (searchText.includes(city)) score += 5;
+      if (searchText.includes(category)) score += 4;
+      if (combined.includes(searchText)) score += 3;
+
+      const cityParts = city.split("-");
+      for (const part of cityParts) {
+        if (part.length > 2 && searchText.includes(part)) score += 1;
+      }
+
+      if (
+        searchText.includes("cook in") &&
+        category === "cook"
+      ) {
+        score += 3;
+      }
+
+      if (
+        searchText.includes("food crawl") &&
+        category === "food-crawl"
+      ) {
+        score += 3;
+      }
+
+      if (
+        searchText.includes("taste") ||
+        searchText.includes("tasting") ||
+        searchText.includes("degustacao")
+      ) {
+        if (category === "taste") score += 3;
+      }
+
+      return { page, score };
+    })
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score);
+
+  if (scored.length) return scored[0].page;
 
   if (city) {
     const fallback = await supabase
