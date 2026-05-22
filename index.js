@@ -106,6 +106,15 @@ function normalizeText(text = "") {
     .replace(/lp do/g, "")
     .replace(/lp da/g, "")
     .replace(/landing page/g, "")
+    .replace(/cook in panama/g, "panama-city cook")
+    .replace(/panama/g, "panama-city")
+    .replace(/cook in mexico/g, "mexico-city cook")
+    .replace(/cook in buenos/g, "buenos-aires cook")
+    .replace(/cook in sao paulo/g, "sao-paulo cook")
+    .replace(/cook in belo horizonte/g, "belo-horizonte cook")
+    .replace(/cook in playa/g, "playa cook")
+    .replace(/cook in santo domingo/g, "santo-domingo cook")
+    .replace(/cook in san jose/g, "san-jose cook")
     .trim();
 }
 
@@ -210,8 +219,24 @@ CONTEXTO DA EMPRESA
 ═══════════════════════════════════════════════════════════
 
 Cidades conhecidas:
-  rio, sao-paulo, lima, cancun, mexico-city, buenos-aires,
-  cartagena, medellin, bogota, cusco, santiago, montevideo
+  rio, sao-paulo, belo-horizonte, brasilia, buenos-aires,
+  cancun, cartagena, cuenca, cuernavaca, curitiba,
+  florianopolis, fortaleza, foz, ilha-grande, lima,
+  mendoza, merida, mexico-city, monterrey, panama-city,
+  playa, quito, salvador, san-jose, santiago,
+  santo-domingo, cusco, bogota, medellin, guadalajara,
+  natal, valparaiso, vina-del-mar
+
+Aliases importantes:
+  Cook in Rio = rio cook
+  Cook in Panama = panama-city cook
+  Cook in Mexico = mexico-city cook
+  Cook in São Paulo = sao-paulo cook
+  Cook in Buenos Aires = buenos-aires cook
+  Cook in Belo Horizonte = belo-horizonte cook
+  Cook in Playa del Carmen = playa cook
+  Cook in Santo Domingo = santo-domingo cook
+  Cook in San José = san-jose cook
 
 Categorias conhecidas:
   cook, food-crawl, taste, bbq, market-tour
