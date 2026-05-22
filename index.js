@@ -6,6 +6,10 @@ const { createClient } = require("@supabase/supabase-js");
 const OpenAI = require("openai");
 const { google } = require("googleapis");
 
+// ═══════════════════════════════════════════════════════════
+// SETUP — servidor, clientes externos
+// ═══════════════════════════════════════════════════════════
+
 const app = express();
 
 app.get("/", (req, res) => {
@@ -43,7 +47,46 @@ const analyticsDataClient = google.analyticsdata({
   auth: oauth2Client,
 });
 
-const userState = {};
+// ═══════════════════════════════════════════════════════════
+// CONSTANTES COMPARTILHADAS
+// ═══════════════════════════════════════════════════════════
+
+const KNOWN_CITIES = [
+  "rio", "sao-paulo", "belo-horizonte", "brasilia", "buenos-aires",
+  "cancun", "cartagena", "cuenca", "curitiba", "florianopolis",
+  "fortaleza", "foz", "ilha-grande", "lima", "mendoza", "merida",
+  "mexico-city", "monterrey", "panama-city", "playa", "quito",
+  "salvador", "san-jose", "santiago", "santo-domingo", "cusco",
+  "bogota", "medellin", "guadalajara", "natal",
+];
+
+const KNOWN_CATEGORIES = [
+  "cook", "food-crawl", "taste", "bbq", "market-tour",
+  "fruit", "drinks-and-appetizers", "seafood",
+];
+
+// ═══════════════════════════════════════════════════════════
+// RATE LIMITING — proteção simples por usuário
+// ═══════════════════════════════════════════════════════════
+
+const lastRequestAt = new Map();
+const MIN_INTERVAL_MS = 3000;
+
+function isRateLimited(telegramId) {
+  const last = lastRequestAt.get(telegramId);
+  const now = Date.now();
+
+  if (last && now - last < MIN_INTERVAL_MS) {
+    return true;
+  }
+
+  lastRequestAt.set(telegramId, now);
+  return false;
+}
+
+// ═══════════════════════════════════════════════════════════
+// UTILITÁRIOS — texto, datas, URLs
+// ═══════════════════════════════════════════════════════════
 
 function normalizeText(text = "") {
   return text
@@ -77,15 +120,45 @@ function extractPath(urlOrPath = "") {
   }
 }
 
-async function analyzeExperimentMessage(message) {
-  const today = new Date().toISOString();
+function formatDate(date) {
+  if (!date) return "sem data";
 
-  const response = await openai.chat.completions.create({
-    model: "gpt-4.1-mini",
-    messages: [
-      {
-        role: "system",
-        content: `
+  return new Date(date).toLocaleString("pt-BR", {
+    timeZone: "America/Sao_Paulo",
+  });
+}
+
+// Converte "YYYY-MM-DD HH:mm" (devolvido pelo agente) para ISO completo
+// usável pelo Postgres. Retorna null se não der pra parsear.
+function isoFromAgentDate(agentDate) {
+  if (!agentDate || typeof agentDate !== "string") return null;
+
+  // Já está em formato ISO completo?
+  if (agentDate.includes("T")) {
+    const d = new Date(agentDate);
+    return isNaN(d.getTime()) ? null : d.toISOString();
+  }
+
+  // Formato "YYYY-MM-DD HH:mm" → assume timezone America/Sao_Paulo (-03:00)
+  const match = agentDate.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/);
+  if (!match) return null;
+
+  const [, y, m, d, h, min] = match;
+  const isoWithTz = `${y}-${m}-${d}T${h}:${min}:00-03:00`;
+  const parsed = new Date(isoWithTz);
+  return isNaN(parsed.getTime()) ? null : parsed.toISOString();
+}
+
+// Sanitiza termos pra interpolação em query .or() do Supabase
+function sanitizeSearchTerm(term = "") {
+  return term.replace(/[,;()]/g, "").trim();
+}
+
+// ═══════════════════════════════════════════════════════════
+// AGENTE — análise estruturada da mensagem (4 camadas)
+// ═══════════════════════════════════════════════════════════
+
+const SYSTEM_PROMPT = `
 Você é o AGENTE DE EXPERIMENTAÇÃO da Cook in Fiesta.
 
 Você não é um parser. Você opera em 4 CAMADAS COGNITIVAS sequenciais,
@@ -94,99 +167,43 @@ e cada camada alimenta a próxima. O JSON de saída é o resultado das
 
 Responda SOMENTE em JSON válido. Sem texto fora.
 
-Data atual: ${today}
-
 ═══════════════════════════════════════════════════════════
 ARQUITETURA — 4 CAMADAS
 ═══════════════════════════════════════════════════════════
 
-╭─ CAMADA 1 — PARSING ──────────────────────────────────────╮
-│ Entender literalmente o que a mensagem diz.               │
-│   • o que será testado                                    │
-│   • onde (plataforma, página, cidade)                     │
-│   • quando (publicação, revisão)                          │
-│   • variantes mencionadas                                 │
-│   • métrica mencionada                                    │
-│ Saída interna: fatos extraídos, sem interpretação.        │
-╰───────────────────────────────────────────────────────────╯
+CAMADA 1 — PARSING
+Entender literalmente o que a mensagem diz:
+  • o que será testado
+  • onde (plataforma, página, cidade)
+  • quando (publicação, revisão)
+  • variantes mencionadas
+  • métrica mencionada
 
-╭─ CAMADA 2 — STRUCTURING ──────────────────────────────────╮
-│ Transformar fatos em experimento bem-formado.             │
-│   • hipótese causal (SE / ENTÃO / PORQUE)                 │
-│   • variantes A/B explícitas (controle vs tratamento)     │
-│   • métrica primária + secundárias                        │
-│   • inferir LP via page_query (city + category)           │
-│   • normalizar datas em ISO usando ${today}               │
-│   • PROPOR variantes quando o usuário não trouxe          │
-│     (você tem repertório — não espera ele entregar pronto)│
-╰───────────────────────────────────────────────────────────╯
+CAMADA 2 — STRUCTURING
+Transformar fatos em experimento bem-formado:
+  • hipótese causal (SE / ENTÃO / PORQUE)
+  • variantes A/B explícitas (controle vs tratamento)
+  • métrica primária + secundárias
+  • inferir LP via page_query (city + category)
+  • normalizar datas em ISO no formato YYYY-MM-DD HH:mm
+  • PROPOR variantes quando o usuário não trouxe
+    (você tem repertório — não espera ele entregar pronto)
 
-╭─ CAMADA 3 — STRATEGIC REASONING ──────────────────────────╮
-│ Avaliar o teste como um especialista sênior avaliaria.    │
-│ NÃO bloqueia, NÃO recusa — sempre anota.                  │
-│ Itens a avaliar:                                          │
-│                                                            │
-│   1. QUALIDADE DO TESTE                                   │
-│      • A mudança tem efeito potencial relevante?          │
-│      • Headline/hero > CTA > microcopy (ordem de impacto) │
-│      • Está testando uma coisa só, ou várias misturadas?  │
-│                                                            │
-│   2. CONFLITOS METODOLÓGICOS                              │
-│      • Múltiplas mudanças simultâneas = não é A/B, é      │
-│        redesign (sinaliza, não recusa)                    │
-│      • Teste em LP com tráfego baixo = pode ser           │
-│        inconclusivo (sinaliza)                            │
-│      • Janela de revisão curta demais pra significância   │
-│                                                            │
-│   3. HISTÓRICO PARECIDO                                   │
-│      • Esse teste (ou parecido) já foi rodado antes?      │
-│      • Já existe literatura/benchmark conhecido?          │
-│        (ex: escassez em CTA é literatura consolidada)     │
-│                                                            │
-│   4. RISCO                                                │
-│      • Impacto na marca? (CTAs agressivos, claims fortes) │
-│      • Impacto em SEO? (mudança de H1, hero)              │
-│      • Impacto em integrações? (tracking, conversões)     │
-│                                                            │
-│   5. CLAREZA CAUSAL                                       │
-│      • Se o teste vencer, vamos saber POR QUE venceu?     │
-│      • A hipótese permite aprender algo generalizável?    │
-│                                                            │
-│ Saída: array strategic_notes com objetos                  │
-│   category, severity, note                                │
-│   severity ∈ info | attention | critical                  │
-│   critical nunca bloqueia, só destaca.                    │
-╰───────────────────────────────────────────────────────────╯
+CAMADA 3 — STRATEGIC REASONING
+Avaliar o teste como um especialista sênior. NÃO bloqueia, NÃO recusa.
+Sempre anota observações em strategic_notes nas dimensões:
+  1. QUALIDADE DO TESTE (impacto potencial, ordem de magnitude)
+  2. CONFLITOS METODOLÓGICOS (múltiplas mudanças, tráfego, janela)
+  3. HISTÓRICO PARECIDO (já foi feito? literatura conhecida?)
+  4. RISCO (marca, SEO, integrações)
+  5. CLAREZA CAUSAL (vai dar pra atribuir o resultado?)
 
-╭─ CAMADA 4 — MEMORY ENGINE ────────────────────────────────╮
-│ Recuperar e aplicar conhecimento acumulado.               │
-│ Fontes (consultadas pelo sistema externo após seu JSON):  │
-│   • aprendizados de testes anteriores                     │
-│   • benchmarks internos (taxa de conversão típica por LP, │
-│     CTR médio por formato no IG, etc)                     │
-│   • padrões históricos da marca                           │
-│   • dados GA4 da LP em questão                            │
-│   • Instagram Insights da conta em questão                │
-│                                                            │
-│ Seu papel: declarar O QUE você QUER consultar para        │
-│ fundamentar a Camada 3. Você não tem acesso direto às     │
-│ fontes — você emite QUERIES que o sistema externo executa.│
-│                                                            │
-│ Saída: array memory_queries com objetos                   │
-│   source, query, why                                      │
-│   source ∈ past_experiments | ga4 | instagram_insights    │
-│          | internal_benchmarks | brand_patterns           │
-│                                                            │
-│ Exemplos de queries:                                      │
-│   • past_experiments: testes anteriores de CTA na LP do   │
-│     Cook in Rio nos últimos 12 meses                      │
-│   • ga4: tráfego semanal e taxa de conversão atual da     │
-│     LP rio cook                                           │
-│   • instagram_insights: retenção média dos últimos 10     │
-│     Reels da conta Cancun                                 │
-│   • internal_benchmarks: lift médio observado em testes   │
-│     de hook nos últimos 6 meses                           │
-╰───────────────────────────────────────────────────────────╯
+severity ∈ info | attention | critical (critical nunca bloqueia, só destaca)
+
+CAMADA 4 — MEMORY ENGINE
+Declare O QUE você QUER consultar para fundamentar a Camada 3.
+Você não acessa as fontes diretamente — emite QUERIES.
+source ∈ past_experiments | ga4 | instagram_insights | internal_benchmarks | brand_patterns
 
 ═══════════════════════════════════════════════════════════
 CONTEXTO DA EMPRESA
@@ -197,358 +214,162 @@ Cidades conhecidas:
   cartagena, medellin, bogota, cusco, santiago, montevideo
 
 Categorias conhecidas:
-  cook         → experiências de cozinhar
-  food-crawl   → tours gastronômicos a pé
-  taste        → tastings, degustações
-  bbq          → experiências de churrasco
-  market-tour  → tours de mercado
+  cook, food-crawl, taste, bbq, market-tour
 
-Inferência obrigatória quando a mensagem mencionar cidade ou nome
-de experiência: city + category + page_query (formato city category).
+Inferência obrigatória quando a mensagem mencionar cidade ou nome de
+experiência: city + category + page_query (formato city category).
 Nunca invente URLs em test_link.
 
 ═══════════════════════════════════════════════════════════
-SCHEMA DE SAÍDA
+SCHEMA DE SAÍDA — JSON válido com aspas duplas
 ═══════════════════════════════════════════════════════════
-
-Estrutura esperada do JSON (use aspas duplas reais na saída — abaixo
-está em notação descritiva por causa do template literal):
 
 {
   intent: create_experiment | unknown,
   experiments: [
     {
-      // CAMADA 1 — fatos extraídos
-      parsed: {
-        raw_request: 1-2 frases (o que a mensagem disse, literal),
-        explicit_fields: lista de campos que vieram explícitos
-      },
-
-      // CAMADA 2 — estrutura do experimento
-      title: string,
-      platform: instagram | landing-page | email | ads | other,
-      format: reels | post | story | landing-page | email | ad-creative,
-      tested_element: CTA | headline | hook | thumbnail | hero | subject-line,
-      variants: {
-        control: versão atual / A,
-        treatment: array — pode haver múltiplas variantes B, C, D,
-        source: user_provided | agent_proposed | mixed
-      },
-      objective: string,
-      hypothesis: SE [mudança] ENTÃO [efeito] PORQUE [mecanismo],
-      metric: {
-        primary: métrica única de decisão,
-        secondary: array,
-        source: user_provided | agent_suggested
-      },
-      channel: string,
-      city: string,
-      category: string,
-      page_query: string,
-      publish_at_iso: YYYY-MM-DD HH:mm,
-      publish_at_text: texto original do usuário,
-      review_at_iso: YYYY-MM-DD HH:mm,
-      review_at_text: texto original do usuário,
-      test_link: string (só se o usuário forneceu),
-
-      // CAMADA 3 — avaliação estratégica
-      strategic_notes: [
-        { category: quality|methodology|history|risk|causality,
-          severity: info|attention|critical,
-          note: string }
-      ],
-
-      // CAMADA 4 — consultas à memória
-      memory_queries: [
-        { source: string, query: string, why: string }
-      ],
-
-      confidence: 0-1 — segurança da estruturação,
-      open_questions: perguntas que o usuário PRECISA responder
+      parsed: { raw_request, explicit_fields },
+      title,
+      platform,
+      format,
+      tested_element,
+      variants: { control, treatment (array), source },
+      objective,
+      hypothesis,
+      metric: { primary, secondary (array), source },
+      channel,
+      city,
+      category,
+      page_query,
+      publish_at_iso (YYYY-MM-DD HH:mm),
+      publish_at_text,
+      review_at_iso (YYYY-MM-DD HH:mm),
+      review_at_text,
+      test_link,
+      strategic_notes: [{ category, severity, note }],
+      memory_queries: [{ source, query, why }],
+      confidence (0-1),
+      open_questions (array)
     }
   ],
-  ambiguity: array de objetos com field e options,
-  follow_up_question: UMA pergunta consolidada, ou vazio se nada falta
+  ambiguity: [{ field, options }],
+  follow_up_question
 }
 
-IMPORTANTE: na saída real, use aspas duplas padrão de JSON. A
-descrição acima usa notação livre apenas para evitar conflito
-com o template literal deste prompt.
-
 ═══════════════════════════════════════════════════════════
-REGRAS DE ESTRUTURAÇÃO (CAMADA 2)
+REGRAS
 ═══════════════════════════════════════════════════════════
 
-HIPÓTESE deve ter mecanismo causal. Nunca tautológica.
-  RUIM:  um CTA mais forte aumentará conversão
-  BOM:   Se trocarmos Reservar agora por Garantir minha vaga
-         (restam 4), a conversão sobe, porque escassez explícita
-         reduz procrastinação no momento de decisão.
+- Nunca invente URLs.
+- Nunca recuse estruturar — sinalize problemas via strategic_notes critical.
+- Variantes ausentes: PROPONHA antes de perguntar.
+- follow_up_question consolida open_questions em UMA pergunta natural.
+- confidence reflete segurança real da estruturação.
+- Hipóteses causais reais com mecanismo, nunca tautológicas.
+- Métricas: sugira 2-3 quando o usuário não definiu (deixe primary vazio).
+- Defaults de review_at quando não informado:
+  - LP: +7 dias
+  - Instagram orgânico: +48h
+  - Ads: +14 dias
+- Se a mensagem não for criação de teste: intent = unknown, experiments = [].
+`;
 
-VARIANTES — você PROPÕE quando o usuário não trouxe.
-  Usuário: vou testar um hook novo no Reels de Cancun
-  → control = hook atual (a ser confirmado pelo usuário)
-  → treatment = [
-       Pergunta direta: Você sabia que existe um prato em Cancun
-        que só 3 lugares servem certo?,
-       Contradição: Todo mundo vai pra Cancun pela praia. Erro.,
-       Número específico: 7 dias em Cancun. Comi em 23 lugares.
-        Esses 3 mudaram a viagem.
-     ]
-  → source = agent_proposed
-  → strategic_notes inclui nota de causalidade sobre múltiplas
-     variantes simultâneas dificultarem atribuição.
+async function analyzeExperimentMessage(message) {
+  const today = new Date().toISOString();
 
-MÉTRICAS — sugira 2-3 candidatas quando o usuário não definiu.
-  CTA / botão (LP)       → conversão | cliques no CTA | reservas confirmadas
-  Headline / hero (LP)   → CTR pra próxima seção | scroll depth | conversão
-  Hook (Reels/Story)     → retenção 3s | retenção até o fim | views
-  Thumbnail              → CTR | views | saves
-  Legenda                → comentários | saves | tempo na publicação
-  Assunto (email)        → open rate | CTR do email
-  Criativo (ads)         → CTR | CPC | CPA | ROAS
+  try {
+    const response = await openai.chat.completions.create({
+      model: "gpt-4.1-mini",
+      messages: [
+        {
+          role: "system",
+          content: SYSTEM_PROMPT + `\n\nData atual (use como âncora pra normalizar datas relativas): ${today}`,
+        },
+        {
+          role: "user",
+          content: message,
+        },
+      ],
+      temperature: 0.2,
+      response_format: { type: "json_object" },
+    });
 
-  Quando agent_suggested: deixe metric.primary vazio e liste as 2-3
-  opções no follow_up_question.
+    const raw = response.choices[0].message.content;
 
-DATAS — converta tudo pra YYYY-MM-DD HH:mm usando ${today}.
-  hoje à noite     → ${today} 20:00
-  amanhã de manhã  → ${today}+1 09:00
-  semana que vem   → ${today}+7 09:00
-  sexta            → próxima sexta a partir de ${today}
-  Defaults sensatos quando o usuário não disse:
-    publish_at_iso → vazio (não bloqueia)
-    review_at_iso  → LP: +7 dias / Instagram orgânico: +48h / Ads: +14 dias
-
-═══════════════════════════════════════════════════════════
-REGRAS DE AVALIAÇÃO (CAMADA 3)
-═══════════════════════════════════════════════════════════
-
-Sempre rode TODAS as 5 dimensões. Se uma dimensão não tem observação
-relevante, simplesmente não emita nota nela.
-
-Exemplos de notas típicas:
-
-  • methodology / critical:
-    Mensagem descreve mudança simultânea de CTA + headline + hero.
-    Isso não é A/B test, é redesign — não será possível atribuir o
-    resultado a nenhum elemento isolado.
-
-  • quality / attention:
-    CTA tem ordem de magnitude menor de impacto que headline. Se há
-    recursos limitados, considere testar headline antes.
-
-  • history / info:
-    Escassez em CTA é padrão consolidado na literatura (Cialdini).
-    Considere testar variável menos óbvia pra ganhar aprendizado.
-
-  • risk / attention:
-    Mudança de H1 da LP impacta SEO. Confirmar que a versão perdedora
-    será revertida rapidamente se houver queda orgânica detectável.
-
-  • causality / attention:
-    Hipótese atual é descritiva (CTA mais forte converte mais).
-    Refinada pra causal: escassez explícita reduz procrastinação.
-
-═══════════════════════════════════════════════════════════
-REGRAS DE MEMÓRIA (CAMADA 4)
-═══════════════════════════════════════════════════════════
-
-Sempre emita memory_queries relevantes. Mínimo recomendado:
-
-  • 1 query a past_experiments (esse teste já foi feito?)
-  • 1 query à fonte de dados da plataforma:
-      - LP → ga4 (tráfego + conversão atual)
-      - Instagram → instagram_insights (baseline da conta)
-      - Email → benchmarks de open/click
-      - Ads → benchmarks de CTR/CPA
-  • 0-2 queries adicionais conforme o caso
-
-Cada query deve ter campo why explicando o que você vai fazer com
-a resposta.
-
-═══════════════════════════════════════════════════════════
-PERGUNTAS AO USUÁRIO
-═══════════════════════════════════════════════════════════
-
-open_questions é lista de coisas que você precisa que o usuário
-responda. Vazio se nada falta.
-
-Pergunte SÓ quando:
-  • variantes ausentes E você não conseguiu propor (raro — você propõe)
-  • plataforma genuinamente ambígua
-  • página ambígua (múltiplas LPs cabem no que ele disse)
-  • objetivo de negócio confuso
-
-NÃO pergunte:
-  • métrica → você sugere 2-3, ele escolhe
-  • hipótese → você propõe, ele valida
-  • datas → use defaults
-  • link → o sistema resolve via page_query
-
-follow_up_question consolida todas as open_questions em UMA pergunta
-natural, agrupada. Vazio se open_questions está vazio.
-
-═══════════════════════════════════════════════════════════
-INTENT = unknown
-═══════════════════════════════════════════════════════════
-
-Quando a mensagem não é criação de teste (pergunta sobre resultado,
-relatório, conversa fora de escopo):
-  experiments = array vazio
-  follow_up_question redireciona com naturalidade.
-
-═══════════════════════════════════════════════════════════
-EXEMPLO COMPLETO
-═══════════════════════════════════════════════════════════
-
-INPUT (com ${today} = 2026-05-22):
-Vou testar um hook novo no Reels de Cancun hoje à noite. Quero
-analisar daqui 2 dias.
-
-OUTPUT esperado (em JSON real, aspas duplas):
-
-intent = create_experiment
-experiments[0]:
-  parsed:
-    raw_request = Testar um hook novo num Reels de Cancun, publicar
-                  hoje à noite, avaliar em 2 dias.
-    explicit_fields = [tested_element, platform, format, city,
-                       publish_at_text, review_at_text]
-  title = Hook novo — Reels Cancun
-  platform = instagram
-  format = reels
-  tested_element = hook
-  variants:
-    control = hook atual (a confirmar com o usuário)
-    treatment = [
-      Pergunta direta: Você sabia que tem um prato em Cancun que só
-       3 lugares servem certo?,
-      Contradição: Todo mundo vai pra Cancun pela praia. Erro.,
-      Número específico: 7 dias em Cancun. 23 lugares. Esses 3
-       mudaram a viagem.
-    ]
-    source = agent_proposed
-  objective = aumentar retenção e views do Reels
-  hypothesis = Se substituirmos o hook atual por uma abertura com
-               tensão informacional (pergunta ou contradição) nos
-               primeiros 2 segundos, a retenção 3s sobe, porque o
-               cérebro do espectador precisa resolver a tensão
-               antes de scrollar.
-  metric:
-    primary = vazio
-    secondary = vazio
-    source = agent_suggested
-  channel = instagram
-  city = cancun
-  category = vazio
-  page_query = vazio
-  publish_at_iso = 2026-05-22 20:00
-  publish_at_text = hoje à noite
-  review_at_iso = 2026-05-24 20:00
-  review_at_text = daqui 2 dias
-  test_link = vazio
-  strategic_notes = [
-    causality / attention:
-      3 variantes simultâneas no mesmo Reels não rodam — Instagram
-      não suporta A/B nativo de hook. Sugestão: rodar 1 variante por
-      Reels, comparar contra baseline da conta dos últimos 10 posts.,
-    methodology / info:
-      Janela de 48h é o mínimo razoável pra Instagram orgânico.
-      Resultados antes disso ainda estão sob efeito de empurrão
-      inicial do algoritmo.,
-    history / info:
-      Hook com tensão informacional é padrão validado em criadores
-      de viagem — vale checar se variantes parecidas já rodaram na
-      conta Cancun.
-  ]
-  memory_queries = [
-    past_experiments:
-      query = testes de hook em Reels da conta Cancun nos últimos
-              6 meses
-      why = Verificar se alguma das variantes propostas já foi
-            testada e qual foi o resultado.,
-    instagram_insights:
-      query = retenção 3s e retenção até o fim dos últimos 10 Reels
-              da conta Cancun
-      why = Estabelecer baseline pra comparar o resultado do teste
-            contra performance típica.,
-    internal_benchmarks:
-      query = lift médio observado em testes de hook nos últimos
-              6 meses entre todas as contas
-      why = Calibrar expectativa de efeito mínimo detectável dado
-            o tráfego típico de um Reels.
-  ]
-  confidence = 0.8
-  open_questions = [
-    Qual é o hook atual do Reels (controle)?,
-    Você quer rodar 1 variante por Reels (mais limpo) ou tentar
-    comparar várias rapidamente?,
-    Qual métrica decide vencedor: retenção 3s, retenção até o fim,
-    ou views totais?
-  ]
-
-ambiguity = vazio
-follow_up_question = 3 coisas pra fechar o teste: (1) qual é o
-hook atual (controle)? (2) prefere rodar 1 variante por Reels ou
-comparar várias em sequência? (3) métrica de decisão — retenção
-3s, retenção até o fim, ou views totais?
-
-═══════════════════════════════════════════════════════════
-REGRAS FINAIS
-═══════════════════════════════════════════════════════════
-
-  • Responda SOMENTE em JSON válido com aspas duplas padrão.
-  • As 4 camadas SEMPRE rodam — mesmo que strategic_notes ou
-    memory_queries fiquem com poucos itens em casos simples.
-  • Nunca invente test_link.
-  • Nunca recuse estruturar — sinalize problemas via strategic_notes
-    com severity critical se for grave.
-  • Variantes ausentes: PROPONHA antes de perguntar. Só pergunte
-    o controle (versão atual) se o usuário não passou.
-  • follow_up_question consolida open_questions em UMA pergunta.
-  • confidence reflete segurança real da estruturação.
-`
-      },
-      {
-        role: "user",
-        content: message
-      }
-    ],
-    temperature: 0.2,
-    response_format: { type: "json_object" }
-  });
-
-  return JSON.parse(response.choices[0].message.content);
+    try {
+      return JSON.parse(raw);
+    } catch (err) {
+      console.error("JSON inválido do agente:", raw);
+      return {
+        intent: "unknown",
+        experiments: [],
+        ambiguity: [],
+        follow_up_question: "Não consegui interpretar sua mensagem. Pode reformular?",
+      };
+    }
+  } catch (err) {
+    console.error("Erro chamando OpenAI:", err);
+    return {
+      intent: "unknown",
+      experiments: [],
+      ambiguity: [],
+      follow_up_question: "Tive um problema técnico ao analisar. Tente de novo em alguns segundos.",
+    };
+  }
 }
 
-function formatDate(date) {
-  if (!date) return "sem data";
+// Chamada mais leve pra extrair APENAS o que o usuário mencionou no follow-up.
+// Diferente do agente principal: não roda 4 camadas, só extrai delta.
+async function extractFollowUpPatch(message) {
+  try {
+    const response = await openai.chat.completions.create({
+      model: "gpt-4.1-mini",
+      messages: [
+        {
+          role: "system",
+          content: `Extraia APENAS os campos que o usuário mencionou nessa resposta de follow-up de um teste.
+Devolva JSON com chaves opcionais (omita o que não foi mencionado):
+{
+  metric: string,
+  hypothesis: string,
+  objective: string,
+  variants_control: string,
+  variants_treatment: array de strings,
+  review_at_iso: YYYY-MM-DD HH:mm
+}
+Nunca invente links. Nunca repita dados que o usuário não disse.`,
+        },
+        { role: "user", content: message },
+      ],
+      temperature: 0.1,
+      response_format: { type: "json_object" },
+    });
 
-  return new Date(date).toLocaleString("pt-BR", {
-    timeZone: "America/Sao_Paulo",
-  });
+    try {
+      return JSON.parse(response.choices[0].message.content);
+    } catch {
+      return {};
+    }
+  } catch (err) {
+    console.error("Erro no follow-up extract:", err);
+    return {};
+  }
 }
 
-async function findLandingPage(analysis, message) {
+// ═══════════════════════════════════════════════════════════
+// LANDING PAGES — busca no Supabase
+// ═══════════════════════════════════════════════════════════
+
+async function findLandingPage(exp, message) {
   const text = normalizeText(
-    `${message} ${analysis.city || ""} ${analysis.category || ""} ${analysis.page_query || ""}`
+    `${message} ${exp?.city || ""} ${exp?.category || ""} ${exp?.page_query || ""}`
   );
 
-  let city = normalizeText(analysis.city || "");
-  let category = normalizeText(analysis.category || "");
+  let city = normalizeText(exp?.city || "");
+  let category = normalizeText(exp?.category || "");
 
   if (!city) {
-    const knownCities = [
-      "rio", "sao-paulo", "belo-horizonte", "brasilia", "buenos-aires",
-      "cancun", "cartagena", "cuenca", "curitiba", "florianopolis",
-      "fortaleza", "foz", "ilha-grande", "lima", "mendoza", "merida",
-      "mexico-city", "monterrey", "panama-city", "playa", "quito",
-      "salvador", "san-jose", "santiago", "santo-domingo", "cusco",
-      "bogota", "medellin", "guadalajara", "natal"
-    ];
-
-    city = knownCities.find((c) => text.includes(c)) || "";
+    city = KNOWN_CITIES.find((c) => text.includes(c)) || "";
   }
 
   if (!category) {
@@ -568,7 +389,7 @@ async function findLandingPage(analysis, message) {
   if (city) query = query.eq("city", city);
   if (category) query = query.ilike("category", `%${category}%`);
 
-  let { data, error } = await query;
+  const { data, error } = await query;
 
   if (error) {
     console.log("Erro ao buscar landing page:", error);
@@ -606,14 +427,13 @@ async function findLandingPage(analysis, message) {
   return null;
 }
 
+// ═══════════════════════════════════════════════════════════
+// GA4 — sumário simples
+// ═══════════════════════════════════════════════════════════
+
 async function getGA4Summary(pagePath = null) {
   const requestBody = {
-    dateRanges: [
-      {
-        startDate: "7daysAgo",
-        endDate: "today",
-      },
-    ],
+    dateRanges: [{ startDate: "7daysAgo", endDate: "today" }],
     metrics: [
       { name: "activeUsers" },
       { name: "sessions" },
@@ -640,7 +460,6 @@ async function getGA4Summary(pagePath = null) {
   });
 
   const rows = response.data.rows?.[0];
-
   if (!rows) return null;
 
   return {
@@ -650,26 +469,188 @@ async function getGA4Summary(pagePath = null) {
   };
 }
 
+// ═══════════════════════════════════════════════════════════
+// MEMORY ENGINE — executa as queries declaradas pelo agente
+// ═══════════════════════════════════════════════════════════
+
+async function runMemoryQueries(memoryQueries = [], exp) {
+  const results = [];
+
+  for (const q of memoryQueries) {
+    try {
+      if (q.source === "past_experiments") {
+        // Busca testes parecidos no Supabase
+        const terms = [exp.tested_element, exp.city, exp.category, exp.platform]
+          .filter(Boolean)
+          .map(sanitizeSearchTerm);
+
+        if (terms.length === 0) continue;
+
+        const orClause = terms
+          .map((t) => `title.ilike.%${t}%,hypothesis.ilike.%${t}%,learning.ilike.%${t}%`)
+          .join(",");
+
+        const { data } = await supabase
+          .from("experiments")
+          .select("id, title, result, learning, status")
+          .or(orClause)
+          .eq("status", "completed")
+          .limit(3);
+
+        if (data && data.length) {
+          results.push({
+            source: "past_experiments",
+            query: q.query,
+            findings: data.map((d) => `#${d.id} ${d.title} → ${d.learning || d.result || "sem aprendizado"}`),
+          });
+        }
+      } else if (q.source === "ga4" && exp.test_link) {
+        // Tenta puxar baseline da página
+        const pagePath = extractPath(exp.test_link);
+        const summary = await getGA4Summary(pagePath);
+
+        if (summary) {
+          results.push({
+            source: "ga4",
+            query: q.query,
+            findings: [
+              `${summary.users} usuários | ${summary.sessions} sessões | ${summary.pageviews} pageviews (últimos 7 dias)`,
+            ],
+          });
+        }
+      }
+      // Outras fontes (instagram_insights, internal_benchmarks, brand_patterns)
+      // ainda não implementadas — pulam silenciosamente
+    } catch (err) {
+      console.error(`Erro executando memory query (${q.source}):`, err.message);
+    }
+  }
+
+  return results;
+}
+
+// ═══════════════════════════════════════════════════════════
+// USER STATE — persistência no Supabase
+// ═══════════════════════════════════════════════════════════
+
+async function getUserState(telegramId) {
+  const { data } = await supabase
+    .from("user_states")
+    .select("*")
+    .eq("telegram_user_id", telegramId)
+    .single();
+
+  return data || null;
+}
+
+async function setUserState(telegramId, state) {
+  await supabase.from("user_states").upsert(
+    {
+      telegram_user_id: telegramId,
+      step: state.step,
+      experiment_id: state.experimentId,
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: "telegram_user_id" }
+  );
+}
+
+async function clearUserState(telegramId) {
+  await supabase
+    .from("user_states")
+    .delete()
+    .eq("telegram_user_id", telegramId);
+}
+
+// ═══════════════════════════════════════════════════════════
+// TEAM MEMBERS — upsert com cache em memória
+// ═══════════════════════════════════════════════════════════
+
+const seenMembers = new Set();
+
+async function ensureTeamMember(telegramId, username, name) {
+  if (seenMembers.has(telegramId)) return;
+
+  await supabase.from("team_members").upsert(
+    {
+      telegram_user_id: telegramId,
+      username,
+      name,
+    },
+    { onConflict: "telegram_user_id" }
+  );
+
+  seenMembers.add(telegramId);
+}
+
+// ═══════════════════════════════════════════════════════════
+// FORMATAÇÃO DE REPLY — resumo do teste pro Telegram
+// ═══════════════════════════════════════════════════════════
+
+function formatStrategicNotes(notes = []) {
+  const relevant = notes.filter(
+    (n) => n.severity === "critical" || n.severity === "attention"
+  );
+
+  if (!relevant.length) return "";
+
+  const icons = { critical: "🚨", attention: "⚠️", info: "ℹ️" };
+
+  return (
+    "\n\n📋 Observações estratégicas:\n" +
+    relevant.map((n) => `${icons[n.severity] || "•"} ${n.note}`).join("\n")
+  );
+}
+
+function formatMemoryFindings(findings = []) {
+  if (!findings.length) return "";
+
+  return (
+    "\n\n🧠 Contexto histórico:\n" +
+    findings
+      .map((f) => `• ${f.source}: ${f.findings.join(" | ")}`)
+      .join("\n")
+  );
+}
+
+function formatVariants(variants) {
+  if (!variants) return "não informadas";
+
+  const lines = [];
+  if (variants.control) lines.push(`A (controle): ${variants.control}`);
+  if (variants.treatment?.length) {
+    variants.treatment.forEach((t, i) => {
+      lines.push(`${String.fromCharCode(66 + i)} (tratamento): ${t}`);
+    });
+  }
+  return lines.length ? lines.join("\n") : "não informadas";
+}
+
+// ═══════════════════════════════════════════════════════════
+// COMANDOS DO BOT
+// ═══════════════════════════════════════════════════════════
+
 bot.start((ctx) => {
   ctx.reply(
     "Bot de experimentos ativo 🚀\n\nComandos:\n/testes_ativos\n/concluidos\n/aprendizados\n/ver ID\n/buscar termo\n/concluir ID\n/ga\n/ga /rio-cook\n\nOu me diga diretamente o que você quer testar."
   );
 });
 
+// ═══════════════════════════════════════════════════════════
+// HANDLER PRINCIPAL — mensagens de texto
+// ═══════════════════════════════════════════════════════════
+
 bot.on("text", async (ctx) => {
   try {
     const message = ctx.message.text.trim();
-
     const telegramId = String(ctx.from.id);
     const chatId = String(ctx.chat.id);
     const username = ctx.from.username || "";
     const name = ctx.from.first_name || "";
 
-    await supabase.from("team_members").upsert({
-      telegram_user_id: telegramId,
-      username,
-      name,
-    });
+    await ensureTeamMember(telegramId, username, name);
+
+    // ─── Comandos ───────────────────────────────────────────
 
     if (message.startsWith("/ga")) {
       try {
@@ -677,9 +658,7 @@ bot.on("text", async (ctx) => {
         const pagePath = rawPath ? extractPath(rawPath) : null;
         const data = await getGA4Summary(pagePath);
 
-        if (!data) {
-          return ctx.reply("Nenhum dado encontrado no GA4.");
-        }
+        if (!data) return ctx.reply("Nenhum dado encontrado no GA4.");
 
         return ctx.reply(
           `📊 Google Analytics ${pagePath ? `(${pagePath})` : "(últimos 7 dias)"}\n\n` +
@@ -730,9 +709,9 @@ bot.on("text", async (ctx) => {
       const text = data
         .map(
           (t) =>
-            `#${t.id} ${t.title}\nResultado: ${
-              t.result || "não informado"
-            }\nAprendizado: ${t.learning || "não informado"}`
+            `#${t.id} ${t.title}\nResultado: ${t.result || "não informado"}\nAprendizado: ${
+              t.learning || "não informado"
+            }`
         )
         .join("\n\n");
 
@@ -760,7 +739,6 @@ bot.on("text", async (ctx) => {
 
     if (message.startsWith("/ver")) {
       const id = message.split(" ")[1];
-
       if (!id) return ctx.reply("Use assim:\n/ver 12");
 
       const { data, error } = await supabase
@@ -772,24 +750,24 @@ bot.on("text", async (ctx) => {
       if (error || !data) return ctx.reply("Teste não encontrado.");
 
       return ctx.reply(
-        `#${data.id} ${data.title}\n\nStatus: ${
-          data.status
-        }\nLink/local: ${
-          data.test_link || "não informado"
-        }\nMétrica: ${
-          data.metric || "não informada"
-        }\nRevisão: ${formatDate(
-          data.review_at
-        )}\nResultado: ${
-          data.result || "não informado"
-        }\nAprendizado: ${data.learning || "não informado"}`
+        `#${data.id} ${data.title}\n\n` +
+          `Status: ${data.status}\n` +
+          `Link/local: ${data.test_link || "não informado"}\n` +
+          `Métrica: ${data.metric || "não informada"}\n` +
+          `Hipótese: ${data.hypothesis || "não informada"}\n` +
+          `Variantes:\n${formatVariants({ control: data.variants_control, treatment: data.variants_treatment })}\n` +
+          `Revisão: ${formatDate(data.review_at)}\n` +
+          `Resultado: ${data.result || "não informado"}\n` +
+          `Aprendizado: ${data.learning || "não informado"}`
       );
     }
 
     if (message.startsWith("/buscar")) {
-      const term = message.replace("/buscar", "").trim();
+      const rawTerm = message.replace("/buscar", "").trim();
+      if (!rawTerm) return ctx.reply("Use assim:\n/buscar cta");
 
-      if (!term) return ctx.reply("Use assim:\n/buscar cta");
+      const term = sanitizeSearchTerm(rawTerm);
+      if (!term) return ctx.reply("Termo de busca inválido.");
 
       const { data, error } = await supabase
         .from("experiments")
@@ -810,11 +788,11 @@ bot.on("text", async (ctx) => {
       const text = data
         .map(
           (t) =>
-            `#${t.id} ${t.title}\nStatus: ${
-              t.status
-            }\nLink: ${t.test_link || "não informado"}\nMétrica: ${
-              t.metric || "não informada"
-            }\nAprendizado: ${t.learning || "sem aprendizado registrado"}`
+            `#${t.id} ${t.title}\nStatus: ${t.status}\nLink: ${
+              t.test_link || "não informado"
+            }\nMétrica: ${t.metric || "não informada"}\nAprendizado: ${
+              t.learning || "sem aprendizado registrado"
+            }`
         )
         .join("\n\n");
 
@@ -823,169 +801,229 @@ bot.on("text", async (ctx) => {
 
     if (message.startsWith("/concluir")) {
       const experimentId = message.split(" ")[1];
-
       if (!experimentId) return ctx.reply("Use assim:\n/concluir 12");
 
-      userState[telegramId] = {
-        experimentId,
+      await setUserState(telegramId, {
         step: "ask_result",
-      };
+        experimentId,
+      });
 
       return ctx.reply("Qual foi o resultado do teste?");
     }
 
-    const state = userState[telegramId];
+    // ─── Conversa com estado ────────────────────────────────
 
-    if (!state) {
-      const analysis = await analyzeExperimentMessage(message);
-      const landingPage = await findLandingPage(analysis, message);
+    const state = await getUserState(telegramId);
 
-      if (analysis.intent !== "create_experiment") {
-        return ctx.reply(
-          "Me diga algo como:\n\nVou testar um CTA novo na LP do Cook in Rio e quero revisar daqui uma semana."
-        );
-      }
-
-      const finalUrl = analysis.test_link || landingPage?.url || null;
-      let missingFields = Array.isArray(analysis.missing_fields)
-  ? analysis.missing_fields
-  : [];
-
-if (finalUrl) {
-  missingFields = missingFields.filter((field) => {
-    const normalized = normalizeText(field);
-    return (
-      !normalized.includes("link") &&
-      !normalized.includes("url") &&
-      !normalized.includes("pagina") &&
-      !normalized.includes("landing")
-    );
-  });
-}
-
-if (!analysis.metric) {
-  missingFields = [...new Set([...missingFields, "metric"])];
-}
-
-const smartFollowUp =
-  finalUrl && !analysis.metric
-    ? `Identifiquei esta página: ${finalUrl}\n\nEstá correta? E qual métrica você quer acompanhar? Sugestões: cliques no CTA, conversão, reservas, sessões ou visualizações da página.`
-    : finalUrl
-    ? `Identifiquei esta página: ${finalUrl}\n\nEstá correta?`
-    : analysis.follow_up_question || "Me envie as informações que faltam.";
-
-      const { data, error } = await supabase
-        .from("experiments")
-        .insert({
-          title: analysis.title || message,
-          raw_message: message,
-          platform: analysis.platform || null,
-          format: analysis.format || null,
-          tested_element: analysis.tested_element || null,
-          objective: analysis.objective || null,
-          hypothesis: analysis.hypothesis || null,
-          metric: analysis.metric || null,
-          channel: analysis.channel || analysis.platform || null,
-          test_link: finalUrl,
-          missing_fields: missingFields,
-          created_by: telegramId,
-          telegram_chat_id: chatId,
-          status: missingFields.length ? "draft" : "active",
-        })
-        .select()
-        .single();
-
-      if (error) {
-        console.log(error);
-        return ctx.reply("Erro ao criar o teste ❌");
-      }
-
-      if (missingFields.length) {
-        userState[telegramId] = {
-          experimentId: data.id,
-          step: "ai_followup",
-        };
-
-        return ctx.reply(
-          `Entendi o teste ✅\n\n` +
-            `ID: ${data.id}\n` +
-            `Título: ${data.title}\n` +
-            `Canal: ${
-              analysis.platform || analysis.channel || "não informado"
-            }\n` +
-            `Elemento testado: ${
-              analysis.tested_element || "não informado"
-            }\n` +
-            `Página identificada: ${finalUrl || "não identificada"}\n\n` +
-            `${smartFollowUp}`
-        );
-      }
-
-      return ctx.reply(
-        `Teste criado ✅\n\n` +
-          `ID: ${data.id}\n` +
-          `Título: ${data.title}\n` +
-          `Página identificada: ${finalUrl || "não identificada"}\n` +
-          `Métrica: ${analysis.metric || "não informada"}`
-      );
-    }
-
-    if (state.step === "ai_followup") {
-      const analysis = await analyzeExperimentMessage(
-        `Informações complementares do teste: ${message}`
-      );
-
+    // ─── ESTADO: aguardando resultado ───────────────────────
+    if (state?.step === "ask_result") {
       await supabase
         .from("experiments")
-        .update({
-          metric: analysis.metric || undefined,
-          hypothesis: analysis.hypothesis || undefined,
-          objective: analysis.objective || undefined,
-          test_link: analysis.test_link || undefined,
-          missing_fields: [],
-          status: "active",
-        })
-        .eq("id", state.experimentId);
+        .update({ result: message })
+        .eq("id", state.experiment_id);
 
-      const experimentId = state.experimentId;
-      delete userState[telegramId];
-
-      return ctx.reply(
-        `Teste atualizado e ativado ✅\n\nID do teste: ${experimentId}`
-      );
-    }
-
-    if (state.step === "ask_result") {
-      await supabase
-        .from("experiments")
-        .update({
-          result: message,
-        })
-        .eq("id", state.experimentId);
-
-      userState[telegramId].step = "ask_learning";
+      await setUserState(telegramId, {
+        step: "ask_learning",
+        experimentId: state.experiment_id,
+      });
 
       return ctx.reply("Qual foi o principal aprendizado desse teste?");
     }
 
-    if (state.step === "ask_learning") {
+    // ─── ESTADO: aguardando aprendizado ─────────────────────
+    if (state?.step === "ask_learning") {
       await supabase
         .from("experiments")
         .update({
           learning: message,
           status: "completed",
         })
-        .eq("id", state.experimentId);
+        .eq("id", state.experiment_id);
 
-      delete userState[telegramId];
+      await clearUserState(telegramId);
 
       return ctx.reply("Teste concluído e aprendizado salvo ✅");
     }
+
+    // ─── ESTADO: follow-up de teste em draft ────────────────
+    if (state?.step === "ai_followup") {
+      const patch = await extractFollowUpPatch(message);
+
+      const updates = {
+        open_questions: [],
+        missing_fields: [],
+        status: "active",
+      };
+
+      if (patch.metric) updates.metric = patch.metric;
+      if (patch.hypothesis) updates.hypothesis = patch.hypothesis;
+      if (patch.objective) updates.objective = patch.objective;
+      if (patch.variants_control) updates.variants_control = patch.variants_control;
+      if (Array.isArray(patch.variants_treatment) && patch.variants_treatment.length) {
+        updates.variants_treatment = patch.variants_treatment;
+      }
+      if (patch.review_at_iso) {
+        const iso = isoFromAgentDate(patch.review_at_iso);
+        if (iso) updates.review_at = iso;
+      }
+
+      await supabase
+        .from("experiments")
+        .update(updates)
+        .eq("id", state.experiment_id);
+
+      const experimentId = state.experiment_id;
+      await clearUserState(telegramId);
+
+      return ctx.reply(`Teste atualizado e ativado ✅\n\nID do teste: ${experimentId}`);
+    }
+
+    // ─── Sem estado: análise nova ───────────────────────────
+
+    if (isRateLimited(telegramId)) {
+      return ctx.reply("Calma aí, manda uma de cada vez 🙏 espera 3 segundos.");
+    }
+
+    const analysis = await analyzeExperimentMessage(message);
+
+    if (analysis.intent !== "create_experiment") {
+      return ctx.reply(
+        analysis.follow_up_question ||
+          "Me diga algo como:\n\nVou testar um CTA novo na LP do Cook in Rio e quero revisar daqui uma semana."
+      );
+    }
+
+    if (!analysis.experiments?.length) {
+      return ctx.reply("Não consegui estruturar o teste. Pode reformular com mais detalhes?");
+    }
+
+    // Por enquanto: 1 experimento por mensagem.
+    // Se houver mais, avisa e processa só o primeiro.
+    if (analysis.experiments.length > 1) {
+      await ctx.reply(
+        `Detectei ${analysis.experiments.length} testes na sua mensagem. Por enquanto trato um por vez — vou começar pelo primeiro.`
+      );
+    }
+
+    const exp = analysis.experiments[0];
+
+    // ─── Identificar landing page ───────────────────────────
+    const landingPage = await findLandingPage(exp, message);
+    const finalUrl = exp.test_link || landingPage?.url || null;
+
+    // ─── Calcular open_questions efetivas ───────────────────
+    let openQuestions = Array.isArray(exp.open_questions) ? [...exp.open_questions] : [];
+
+    // Se a página foi identificada, remove perguntas sobre link/URL
+    if (finalUrl) {
+      openQuestions = openQuestions.filter((q) => {
+        const normalized = normalizeText(q);
+        return (
+          !normalized.includes("link") &&
+          !normalized.includes("url") &&
+          !normalized.includes("pagina") &&
+          !normalized.includes("landing")
+        );
+      });
+    }
+
+    // Métrica é não-bloqueante mas adiciona pergunta se faltou
+    const metricPrimary = exp.metric?.primary || null;
+    if (!metricPrimary && !openQuestions.some((q) => /m[ée]trica/i.test(q))) {
+      openQuestions.push("Qual métrica define o vencedor desse teste?");
+    }
+
+    // ─── Executar memory queries ────────────────────────────
+    const memoryFindings = await runMemoryQueries(exp.memory_queries, {
+      ...exp,
+      test_link: finalUrl,
+    });
+
+    // ─── Normalizar datas ───────────────────────────────────
+    const publishAt = isoFromAgentDate(exp.publish_at_iso);
+    const reviewAt = isoFromAgentDate(exp.review_at_iso);
+
+    // ─── Inserir no Supabase ────────────────────────────────
+    const { data, error } = await supabase
+      .from("experiments")
+      .insert({
+        title: exp.title || message,
+        raw_message: message,
+        platform: exp.platform || null,
+        format: exp.format || null,
+        tested_element: exp.tested_element || null,
+        objective: exp.objective || null,
+        hypothesis: exp.hypothesis || null,
+        metric: metricPrimary,
+        metric_secondary: exp.metric?.secondary || [],
+        channel: exp.channel || exp.platform || null,
+        city: exp.city || null,
+        category: exp.category || null,
+        test_link: finalUrl,
+        variants_control: exp.variants?.control || null,
+        variants_treatment: exp.variants?.treatment || [],
+        variants_source: exp.variants?.source || null,
+        strategic_notes: exp.strategic_notes || [],
+        memory_queries: exp.memory_queries || [],
+        memory_findings: memoryFindings,
+        confidence: typeof exp.confidence === "number" ? exp.confidence : null,
+        open_questions: openQuestions,
+        missing_fields: openQuestions, // mantido pra compat com schema antigo
+        publish_at: publishAt,
+        review_at: reviewAt,
+        created_by: telegramId,
+        telegram_chat_id: chatId,
+        status: openQuestions.length ? "draft" : "active",
+      })
+      .select()
+      .single();
+
+    if (error) {
+      console.log(error);
+      return ctx.reply("Erro ao criar o teste ❌");
+    }
+
+    // ─── Montar reply ───────────────────────────────────────
+    const notesText = formatStrategicNotes(exp.strategic_notes);
+    const findingsText = formatMemoryFindings(memoryFindings);
+
+    const summary =
+      `${openQuestions.length ? "Entendi o teste ✅" : "Teste criado ✅"}\n\n` +
+      `ID: ${data.id}\n` +
+      `Título: ${data.title}\n` +
+      `Canal: ${exp.platform || exp.channel || "não informado"}\n` +
+      `Elemento testado: ${exp.tested_element || "não informado"}\n` +
+      `Hipótese: ${exp.hypothesis || "não informada"}\n` +
+      `\nVariantes:\n${formatVariants(exp.variants)}\n` +
+      `\nPágina identificada: ${finalUrl || "não identificada"}\n` +
+      `Métrica: ${metricPrimary || "a definir"}\n` +
+      `Revisão: ${formatDate(reviewAt)}` +
+      notesText +
+      findingsText;
+
+    if (openQuestions.length) {
+      await setUserState(telegramId, {
+        step: "ai_followup",
+        experimentId: data.id,
+      });
+
+      const followUp =
+        analysis.follow_up_question ||
+        openQuestions.join("\n");
+
+      return ctx.reply(`${summary}\n\n❓ ${followUp}`);
+    }
+
+    return ctx.reply(summary);
   } catch (error) {
     console.log(error);
     ctx.reply("Erro inesperado ❌");
   }
 });
+
+// ═══════════════════════════════════════════════════════════
+// LEMBRETES — check periódico
+// ═══════════════════════════════════════════════════════════
 
 async function checkReminders() {
   const now = new Date().toISOString();
@@ -1005,33 +1043,34 @@ async function checkReminders() {
   for (const experiment of data) {
     if (!experiment.telegram_chat_id) continue;
 
-    await bot.telegram.sendMessage(
-      experiment.telegram_chat_id,
-      `🔔 Hora de revisar o teste:\n\n${experiment.title}\n\nMétrica: ${
-        experiment.metric || "não informada"
-      }\nLink/local: ${
-        experiment.test_link || "não informado"
-      }\n\nPara concluir:\n/concluir ${experiment.id}`
-    );
+    try {
+      await bot.telegram.sendMessage(
+        experiment.telegram_chat_id,
+        `🔔 Hora de revisar o teste:\n\n${experiment.title}\n\nMétrica: ${
+          experiment.metric || "não informada"
+        }\nLink/local: ${experiment.test_link || "não informado"}\n\nPara concluir:\n/concluir ${experiment.id}`
+      );
 
-    await supabase
-      .from("experiments")
-      .update({
-        reminded_at: new Date().toISOString(),
-      })
-      .eq("id", experiment.id);
+      await supabase
+        .from("experiments")
+        .update({ reminded_at: new Date().toISOString() })
+        .eq("id", experiment.id);
+    } catch (err) {
+      console.error(`Erro enviando lembrete do teste ${experiment.id}:`, err.message);
+    }
   }
 }
 
 setInterval(checkReminders, 60 * 1000);
 
-bot.launch()
-  .then(() => {
-    console.log("Bot rodando 🚀");
-  })
-  .catch((error) => {
-    console.log("Erro ao iniciar bot:", error.message);
-  });
+// ═══════════════════════════════════════════════════════════
+// BOOT
+// ═══════════════════════════════════════════════════════════
+
+bot
+  .launch()
+  .then(() => console.log("Bot rodando 🚀"))
+  .catch((error) => console.log("Erro ao iniciar bot:", error.message));
 
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
